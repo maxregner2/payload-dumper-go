@@ -276,100 +276,90 @@ func (p *Payload) Extract(partition *chromeos_update_engine.PartitionUpdate, out
 
 			break
 
-		case chromeos_update_engine.InstallOperation_REPLACE_BZ:
-			reader := bzip2.NewReader(teeReader)
-			n, err := io.Copy(out, reader)
-			if err != nil {
-				return err
-			}
-			if n != expectedUncompressedBlockSize {
-				return fmt.Errorf("Verify failed (Unexpected bytes written): %s (%d != %d)", name, n, expectedUncompressedBlockSize)
-			}
-			break
+		func (p *Payload) ExtractSelectedTo(targetDirectory string, partitions []string) error {
+    if !p.initialized {
+        return errors.New("Payload has not been initialized")
+    }
+    p.progress = mpb.New()
 
-		case chromeos_update_engine.InstallOperation_ZERO:
-			reader := bytes.NewReader(make([]byte, expectedUncompressedBlockSize))
-			n, err := io.Copy(out, reader)
-			if err != nil {
-				return err
-			}
+    p.requests = make(chan *request, 100)
+    p.spawnExtractWorkers(p.concurrency)
 
-			if n != expectedUncompressedBlockSize {
-				return fmt.Errorf("Verify failed (Unexpected bytes written): %s (%d != %d)", name, n, expectedUncompressedBlockSize)
-			}
-			break
+    sort.Strings(partitions)
 
-		default:
-			return fmt.Errorf("Unhandled operation type: %s", operation.GetType().String())
-		}
+    for _, partition := range p.deltaArchiveManifest.Partitions {
+        if len(partitions) > 0 {
+            idx := sort.SearchStrings(partitions, *partition.PartitionName)
+            if idx == len(partitions) || partitions[idx] != *partition.PartitionName {
+                continue
+            }
+        }
 
-		// verify hash
-		hash := hex.EncodeToString(bufSha.Sum(nil))
-		expectedHash := hex.EncodeToString(operation.GetDataSha256Hash())
-		if expectedHash != "" && hash != expectedHash {
-			return fmt.Errorf("Verify failed (Checksum mismatch): %s (%s != %s)", name, hash, expectedHash)
-		}
-	}
+        p.workerWG.Add(1)
+        p.requests <- &request{
+            partition:       partition,
+            targetDirectory: targetDirectory,
+        }
+    }
 
-	return nil
+    p.workerWG.Wait()
+    close(p.requests)
+
+    return nil
 }
 
-func (p *Payload) worker() {
-	for req := range p.requests {
-		partition := req.partition
-		targetDirectory := req.targetDirectory
-
-		name := fmt.Sprintf("%s.img", partition.GetPartitionName())
-		filepath := fmt.Sprintf("%s/%s", targetDirectory, name)
-		file, err := os.OpenFile(filepath, os.O_TRUNC|os.O_CREATE|os.O_WRONLY, 0755)
-		if err != nil {
-		}
-		if err := p.Extract(partition, file); err != nil {
-			fmt.Println(err.Error())
-		}
-
-		p.workerWG.Done()
-	}
+func (p *Payload) ExtractAllTo(targetDirectory string) error {
+    return p.ExtractSelectedTo(targetDirectory, nil)
 }
 
-func (p *Payload) spawnExtractWorkers(n int) {
-	for i := 0; i < n; i++ {
-		go p.worker()
-	}
+func (p *Payload) Close() {
+    p.file.Close()
+    p.progress.Wait()
 }
 
-func (p *Payload) ExtractSelected(targetDirectory string, partitions []string) error {
-	if !p.initialized {
-		return errors.New("Payload has not been initialized")
-	}
-	p.progress = mpb.New()
+func (p *Payload) GetPartition(partitionName string) (*chromeos_update_engine.PartitionUpdate, error) {
+    for _, partition := range p.deltaArchiveManifest.Partitions {
+        if *partition.PartitionName == partitionName {
+            return partition, nil
+        }
+    }
 
-	p.requests = make(chan *request, 100)
-	p.spawnExtractWorkers(p.concurrency)
-
-	sort.Strings(partitions)
-
-	for _, partition := range p.deltaArchiveManifest.Partitions {
-		if len(partitions) > 0 {
-			idx := sort.SearchStrings(partitions, *partition.PartitionName)
-			if idx == len(partitions) || partitions[idx] != *partition.PartitionName {
-				continue
-			}
-		}
-
-		p.workerWG.Add(1)
-		p.requests <- &request{
-			partition:       partition,
-			targetDirectory: targetDirectory,
-		}
-	}
-
-	p.workerWG.Wait()
-	close(p.requests)
-
-	return nil
+    return nil, fmt.Errorf("Partition not found: %s", partitionName)
 }
 
-func (p *Payload) ExtractAll(targetDirectory string) error {
-	return p.ExtractSelected(targetDirectory, nil)
+func (p *Payload) GetPartitionNames() []string {
+    var names []string
+    for _, partition := range p.deltaArchiveManifest.Partitions {
+        names = append(names, *partition.PartitionName)
+    }
+
+    return names
 }
+
+func (p *Payload) GetPartitionSizes() map[string]uint64 {
+    sizes := make(map[string]uint64)
+    for _, partition := range p.deltaArchiveManifest.Partitions {
+        sizes[*partition.PartitionName] = partition.GetNewPartitionInfo().GetSize()
+    }
+
+    return sizes
+}
+
+func (p *Payload) GetPartitionHashes() map[string]string {
+    hashes := make(map[string]string)
+    for _, partition := range p.deltaArchiveManifest.Partitions {
+        hashes[*partition.PartitionName] = hex.EncodeToString(partition.GetDataSha256Hash())
+    }
+
+    return hashes
+}
+
+func (p *Payload) GetPartitionOperations(partitionName string) ([]*chromeos_update_engine.InstallOperation, error) {
+    partition, err := p.GetPartition(partitionName)
+    if err != nil {
+        return nil, err
+    }
+
+    return partition.Operations, nil
+}
+
